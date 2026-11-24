@@ -14,7 +14,10 @@ HELP = """Commands:
   deregister
   subscribe <location> <category>
   unsubscribe <location> <category>
-  publish <category> <location> <severity> <title> <description> <file>  
+  publish <category> <location> <severity> <title> <description> <file>
+  update <incident_id> <severity> <title> <description>
+  close <incident_id> <reason>
+  status <incident_id> <status>    status = SAFE | NEED_HELP | LEFT_AREA
   info                             show this client's state
   help
   quit"""
@@ -39,7 +42,8 @@ class Client:
         self.rq = 0
         self.rq_lock = threading.Lock()
         self.pending = {}
-        self.notify_handlers = {"ALERT": self.on_alert}
+        self.notify_handlers = {"ALERT": self.on_alert, "ALERT_UPDATE": self.on_alert_update,
+                                "ALL_CLEAR": self.on_all_clear}
         self.alerts = {}
         self.seen = set()
         self.seen_lock = threading.Lock()
@@ -188,6 +192,71 @@ class Client:
         f"    {title.replace('_', ' ')}: {desc.replace('_', ' ')}"
         + (f"\n    Attachment: {attach}" if attach != "NONE" else "") + "\n> ", end="")
 
+    #2.6 
+    def on_alert_update(self, t, addr):
+        if addr[0] != self.server[0]:
+            self.log.info("ALERT_UPDATE from unknown source %s ignored", addr[0])
+            return
+        if len(t) != 7:
+            self.log.info("Malformed ALERT_UPDATE ignored")
+            return
+        rq = t[1]
+        incident_id = t[2]
+        version = t[3]
+        severity = t[4]
+        title = t[5]
+        description = t[6]
+
+        if severity == "CRITICAL":
+            self.send(f"ALERT_ACK {rq} {incident_id} {version} {self.name}", self.server)
+
+        with self.seen_lock:
+            duplicate = (incident_id, version) in self.seen
+            self.seen.add((incident_id, version))
+        if duplicate:
+            self.log.info("Duplicate ALERT_UPDATE %s v%s: not displayed", incident_id, version)
+            return
+
+        if incident_id in self.alerts:
+            self.alerts[incident_id]["version"] = version
+            self.alerts[incident_id]["severity"] = severity
+            self.alerts[incident_id]["title"] = title
+            self.alerts[incident_id]["description"] = description
+
+        print(f"\n*** {severity} UPDATE {incident_id} (v{version})\n"
+              f"    {title.replace('_', ' ')}: {description.replace('_', ' ')}\n> ", end="")
+
+    #2.7
+    def on_all_clear(self, t, addr):
+        # ALL_CLEAR RQ# Incident_ID Version Message
+        if addr[0] != self.server[0]:
+            self.log.info("ALL_CLEAR from unknown source %s ignored", addr[0])
+            return
+        if len(t) != 5:
+            self.log.info("Malformed ALL_CLEAR ignored")
+            return
+        rq = t[1]
+        incident_id = t[2]
+        version = t[3]
+        message = t[4]
+
+        # ALL_CLEAR is always acknowledged, even if it is a duplicate
+        self.send(f"ALERT_ACK {rq} {incident_id} {version} {self.name}", self.server)
+
+        with self.seen_lock:
+            duplicate = (incident_id, version) in self.seen
+            self.seen.add((incident_id, version))
+        if duplicate:
+            self.log.info("Duplicate ALL_CLEAR %s v%s: not displayed", incident_id, version)
+            return
+
+        if incident_id in self.alerts:
+            self.alerts[incident_id]["version"] = version
+            self.alerts[incident_id]["status"] = "CLOSED"
+
+        print(f"\n*** ALL CLEAR {incident_id} (v{version})\n"
+              f"    {message.replace('_', ' ')}\n> ", end="")
+
     def cmd_publish(self, args):
         if len(args) not in (5,6):
             print("Input all arguments when publishing an alert.")
@@ -207,6 +276,59 @@ class Client:
         else:
             self.log.info("Publish denied: %s", " ".join(reply[2:]) or "no reason given")
 
+    #2.6
+    def cmd_update(self, args):
+        if len(args) != 4:
+            print("Usage: update <incident_id> <severity> <title> <description>")
+            return
+        incident_id = args[0].upper()
+        severity = args[1].upper()
+        title = args[2]
+        description = args[3]
+
+        reply = self.request("UPDATE_ALERT", incident_id, severity, title, description)
+        if not reply:
+            return
+        if reply[0] == "ALERT_UPDATED":
+            self.log.info("Incident %s updated, now version %s", reply[2], reply[3])
+        else:
+            self.log.info("Update denied: %s", " ".join(reply[2:]) or "no reason given")
+
+    #2.7
+    def cmd_close(self, args):
+        if len(args) != 2:
+            print("Usage: close <incident_id> <reason>")
+            return
+        incident_id = args[0].upper()
+        reason = args[1]
+
+        reply = self.request("CLOSE_ALERT", incident_id, reason)
+        if not reply:
+            return
+        if reply[0] == "ALERT_CLOSED":
+            self.log.info("Incident %s closed", reply[2])
+        else:
+            self.log.info("Close denied: %s", " ".join(reply[2:]) or "no reason given")
+
+    #2.8
+    def cmd_status(self, args):
+        if len(args) != 2:
+            print("Usage: status <incident_id> <SAFE|NEED_HELP|LEFT_AREA>")
+            return
+        if not self.name:
+            print("Register first.")
+            return
+        incident_id = args[0].upper()
+        status = args[1].upper()
+
+        reply = self.request("STATUS_REPORT", incident_id, self.name, status)
+        if not reply:
+            return
+        if reply[0] == "STATUS_RECORDED":
+            self.log.info("Status %s recorded for %s", status, incident_id)
+        else:
+            self.log.info("Status rejected: %s", " ".join(reply[2:]) or "no reason given")
+
 
     def cmd_info(self, args):
         subs = ", ".join(f"{l}/{c}" for l, c in sorted(self.subscriptions)) or "-"
@@ -224,6 +346,9 @@ class Client:
             "subscribe": self.cmd_subscribe,
             "unsubscribe": lambda a: self.cmd_subscribe(a, unsubscribe=True),
             "publish": self.cmd_publish,
+            "update": self.cmd_update,
+            "close": self.cmd_close,
+            "status": self.cmd_status,
             "info": self.cmd_info,
             "help": lambda a: print(HELP),
         }

@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from common import (BASE_DIR, CATEGORIES, LOCATIONS, REPLY_CACHE_TTL, ROLES, SERVER_TCP_PORT,
-                    SERVER_UDP_PORT, SEVERITY, TIMEOUT, MAX_ATTEMPTS, fmt_list, local_ip, make_logger, make_tcp_listener,
+                    SERVER_UDP_PORT, SEVERITY, STATUSES, TIMEOUT, MAX_ATTEMPTS, fmt_list, local_ip, make_logger, make_tcp_listener,
                     make_udp_socket, recv_line, tokenize, udp_recv, valid_ip, valid_name,
                     valid_port, matches)
 
@@ -56,12 +56,16 @@ class EmergencyServer:
             "SUBSCRIBE": self.on_subscribe,
             "UNSUBSCRIBE": self.on_unsubscribe,
             "PUBLISH_ALERT": self.on_publish_alert,
+            "UPDATE_ALERT": self.on_update_alert,
+            "CLOSE_ALERT": self.on_close_alert,
+            "STATUS_REPORT": self.on_status_report,
             "ALERT_ACK": self.on_alert_ack,
         }
         self.tcp_handlers = {}
         self.ack_timeout = args.ack_timeout
         self.awaiting = {}                   
         self.store.data.setdefault("deliveries", {})
+        self.store.data.setdefault("status_reports", {})
         self.log.info("Emergency Server listening on UDP %s:%d and TCP %s:%d",
                       args.host, args.udp_port, args.host, args.tcp_port)
         self.log.info("Clients on other computers connect with: --server %s", local_ip())
@@ -377,7 +381,165 @@ class EmergencyServer:
         self.pool.submit(self.distribute, inc_id)
 
         return f"ALERT_ACCEPTED {rq} {inc_id}"
-    
+
+    #2.6 Updating an existing incident
+    def on_update_alert(self, t, addr):
+        # UPDATE_ALERT RQ# Incident_ID Severity Title Description
+        rq = t[1]
+        deny = f"UPDATE_DENIED {rq} "
+
+        if len(t) != 6:
+            return deny + "Malformed_Message"
+        incident_id = t[2].upper()
+        severity = t[3].upper()
+        title = t[4]
+        description = t[5]
+
+        name, user = self.user_by_addr(addr)
+        if user is None:
+            return deny + "Not_Registered"
+
+        incident = self.incidents.get(incident_id)
+        if incident is None:
+            return deny + "Unknown_Incident"
+        if incident["status"] != "ACTIVE":
+            return deny + "Incident_Closed"
+        if incident["publisher"] != name:
+            return deny + "Not_Incident_Owner"
+        if severity not in SEVERITY:
+            return deny + "Invalid_Severity"
+
+        incident["severity"] = severity
+        incident["title"] = title
+        incident["description"] = description
+        incident["version"] = incident["version"] + 1
+        self.store.save()
+
+        self.log.info("%s updated %s, new version %d (%s)", name, incident_id,
+                      incident["version"], severity)
+
+        # send ALERT_UPDATE in its own thread so the reply is not delayed
+        threading.Thread(target=self.send_update, args=(incident_id,), daemon=True).start()
+
+        return f"ALERT_UPDATED {rq} {incident_id} {incident['version']}"
+
+    def send_update(self, incident_id):
+        # ALERT_UPDATE RQ# Incident_ID Version Severity Title Description
+        with self.store.lock:
+            incident = self.incidents[incident_id]
+            version = incident["version"]
+            severity = incident["severity"]
+            recipients = self.find_recipients(incident)
+            messages = []
+            for name, addr in recipients:
+                rq = self.next_rq()
+                msg = (f"ALERT_UPDATE {rq} {incident_id} {version} {severity} "
+                       f"{incident['title']} {incident['description']}")
+                messages.append((rq, name, addr, msg))
+                if severity == "CRITICAL":
+                    self.set_delivery(incident_id, version, name, "PENDING")
+            self.store.save()
+
+        if len(messages) == 0:
+            self.log.info("%s: no matching subscribers for the update", incident_id)
+
+        for rq, name, addr, msg in messages:
+            if severity == "CRITICAL":
+                # same ACK + retransmission as a CRITICAL ALERT (section 2.5)
+                self.send_reliable(rq, name, addr, msg, incident_id, version)
+            else:
+                self.send(msg, addr)
+
+    #2.7 Closing an incident and ALL_CLEAR
+    def on_close_alert(self, t, addr):
+        # CLOSE_ALERT RQ# Incident_ID Reason
+        rq = t[1]
+        deny = f"CLOSE_DENIED {rq} "
+
+        if len(t) != 4:
+            return deny + "Malformed_Message"
+        incident_id = t[2].upper()
+        reason = t[3]
+
+        name, user = self.user_by_addr(addr)
+        if user is None:
+            return deny + "Not_Registered"
+
+        incident = self.incidents.get(incident_id)
+        if incident is None:
+            return deny + "Unknown_Incident"
+        if incident["status"] != "ACTIVE":
+            return deny + "Incident_Closed"
+        if incident["publisher"] != name:
+            return deny + "Not_Incident_Owner"
+
+        incident["status"] = "CLOSED"
+        incident["version"] = incident["version"] + 1
+        incident["close_reason"] = reason
+        self.store.save()
+
+        self.log.info("%s closed %s, new version %d (%s)", name, incident_id,
+                      incident["version"], reason)
+
+        threading.Thread(target=self.send_all_clear, args=(incident_id,), daemon=True).start()
+
+        return f"ALERT_CLOSED {rq} {incident_id}"
+
+    def send_all_clear(self, incident_id):
+        # ALL_CLEAR RQ# Incident_ID Version Message
+        with self.store.lock:
+            incident = self.incidents[incident_id]
+            version = incident["version"]
+            recipients = self.find_recipients(incident)
+            messages = []
+            for name, addr in recipients:
+                rq = self.next_rq()
+                msg = f"ALL_CLEAR {rq} {incident_id} {version} {incident['close_reason']}"
+                messages.append((rq, name, addr, msg))
+                self.set_delivery(incident_id, version, name, "PENDING")
+            self.store.save()
+
+        if len(messages) == 0:
+            self.log.info("%s: no matching subscribers for ALL_CLEAR", incident_id)
+
+        # ALL_CLEAR always needs an ALERT_ACK, so always use retransmission (section 2.5)
+        for rq, name, addr, msg in messages:
+            self.send_reliable(rq, name, addr, msg, incident_id, version)
+
+    #2.8 User safety / response status
+    def on_status_report(self, t, addr):
+        # STATUS_REPORT RQ# Incident_ID Name Status
+        rq = t[1]
+        reject = f"STATUS_REJECTED {rq} "
+
+        if len(t) != 5:
+            return reject + "Malformed_Message"
+        incident_id = t[2].upper()
+        name = t[3]
+        status = t[4].upper()
+
+        sender_name, user = self.user_by_addr(addr)
+        if user is None or sender_name != name:
+            return reject + "Not_Registered"
+        if user["role"] == "PUBLISHER":
+            return reject + "Unauthorized_Role"
+
+        incident = self.incidents.get(incident_id)
+        if incident is None:
+            return reject + "Unknown_Incident"
+        if incident["status"] != "ACTIVE":
+            return reject + "Incident_Closed"
+        if status not in STATUSES:
+            return reject + "Invalid_Status"
+
+        # keep only the most recent status for this user and incident
+        key = incident_id + "|" + name
+        self.store.data["status_reports"][key] = status
+        self.store.save()
+
+        self.log.info("%s reported %s for %s", name, status, incident_id)
+        return f"STATUS_RECORDED {rq}"
+
 
     def tcp_loop(self):
         while True:

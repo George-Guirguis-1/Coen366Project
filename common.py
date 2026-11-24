@@ -19,6 +19,9 @@ CATEGORIES = ("FIRE", "SECURITY", "WEATHER", "POWER", "BUILDING", "GENERAL", "AL
 #Emergency incident severity levels
 SEVERITY = ("INFO", "WARNING", "CRITICAL")
 
+#User safety statuses (2.8)
+STATUSES = ("SAFE", "NEED_HELP", "LEFT_AREA")
+
 
 BASE_DIR = Path(__file__).resolve().parent
 _TOKEN = re.compile(r"\[[^\]]*\]|\S+")
