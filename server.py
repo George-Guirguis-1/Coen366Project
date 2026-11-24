@@ -8,9 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from common import (BASE_DIR, CATEGORIES, LOCATIONS, REPLY_CACHE_TTL, ROLES, SERVER_TCP_PORT,
-                    SERVER_UDP_PORT, fmt_list, local_ip, make_logger, make_tcp_listener,
+                    SERVER_UDP_PORT, SEVERITY, TIMEOUT, MAX_ATTEMPTS, fmt_list, local_ip, make_logger, make_tcp_listener,
                     make_udp_socket, recv_line, tokenize, udp_recv, valid_ip, valid_name,
-                    valid_port)
+                    valid_port, matches)
 
 
 class Store:
@@ -41,6 +41,10 @@ class EmergencyServer:
         self.log = make_logger("SERVER", "server.log")
         self.store = Store(args.state, self.log)
         self.users = self.store.data["users"]
+        self.store.data.setdefault("incidents", {})
+        self.store.data.setdefault("next_incident", 101)
+        self.store.data.setdefault("next_rq", 1)
+        self.incidents = self.store.data["incidents"]
         self.loss = args.loss
         self.udp = make_udp_socket(args.host, args.udp_port)
         self.tcp = make_tcp_listener(args.host, args.tcp_port)
@@ -51,14 +55,24 @@ class EmergencyServer:
             "DE-REGISTER": self.on_deregister,
             "SUBSCRIBE": self.on_subscribe,
             "UNSUBSCRIBE": self.on_unsubscribe,
+            "PUBLISH_ALERT": self.on_publish_alert,
+            "ALERT_ACK": self.on_alert_ack,
         }
         self.tcp_handlers = {}
+        self.ack_timeout = args.ack_timeout
+        self.awaiting = {}                   
+        self.store.data.setdefault("deliveries", {})
         self.log.info("Emergency Server listening on UDP %s:%d and TCP %s:%d",
                       args.host, args.udp_port, args.host, args.tcp_port)
         self.log.info("Clients on other computers connect with: --server %s", local_ip())
         self.log.info("Recovered %d user(s) from %s", len(self.users), self.store.path.name)
         if self.users:
             self.print_users()
+
+    def next_rq(self):
+        n = self.store.data["next_rq"]
+        self.store.data["next_rq"] += 1
+        return f"{n:02d}"
 
     def send(self, msg, addr):
         self.udp.sendto(msg.encode("utf-8"), addr)
@@ -121,6 +135,104 @@ class EmergencyServer:
             if self.owns(user, addr):
                 return name, user
         return None, None
+
+
+    #2.4 helper methods
+    def find_recipients(self, incident):
+        recipients = []
+        for name, user in self.users.items():
+            if user["role"] == "PUBLISHER":
+                continue
+            if any(matches(s, incident["category"], incident["location"]) for s in user["subscriptions"]):
+                recipients.append((name, tuple(user["seen"])))
+        return recipients
+
+    def distribute(self, inc_id):
+        try:
+            with self.store.lock:
+                inc = self.incidents.get(inc_id)
+                if inc is None:
+                    return
+                outgoing = []
+                for name, addr in self.find_recipients(inc):
+                    msg = (f"ALERT {self.next_rq()} {inc_id} {inc['version']} {inc['category']} "
+                           f"{inc['location']} {inc['severity']} {inc['title']} "
+                           f"{inc['description']} {inc['attachment']}")
+                    outgoing.append((name, addr, msg))
+                    if inc["severity"] == "CRITICAL":
+                        self.set_delivery(inc_id, inc["version"], name, "PENDING")
+                self.store.save()
+            if not outgoing:
+                self.log.info("%s: no matching subscribers", inc_id)
+            for name, addr, msg in outgoing:
+                if inc["severity"] == "CRITICAL":
+                    rq = msg.split()[1]
+                    self.send_reliable(rq, name, addr, msg, inc_id, inc["version"])
+                else:
+                    self.send(msg, addr)
+        except Exception:
+            self.log.exception("Distribution of %s failed", inc_id)
+
+
+    #2.5 helper methods
+
+    def set_delivery(self, inc_id, version, name, status):
+
+        d = self.store.data["deliveries"].setdefault(inc_id, {}). setdefault(str(version), {})
+        d[name] = status
+
+    def send_reliable(self, rq, name, addr, msg, inc_id, version):
+        with self.store.lock:
+            self.awaiting[rq] = {"name": name, "addr": addr, "msg": msg, "inc_id": inc_id, "version": version, "attempt": 1}
+        self.send(msg, addr)
+        self.start_timer(rq)
+
+    def start_timer(self, rq):
+        timer = threading.Timer(self.ack_timeout, self.on_ack_timeout, args=(rq,))
+        timer.daemon = True
+        with self.store.lock:
+            entry = self.awaiting.get(rq)
+            if entry is None:
+                return
+            entry["timer"] = timer
+            timer.start()
+
+    def on_ack_timeout(self, rq):
+       
+        with self.store.lock:
+            entry = self.awaiting.get(rq)
+            if entry is None:  # the ACK arrived meanwhile
+                return
+            if entry["attempt"] >= MAX_ATTEMPTS:
+                del self.awaiting[rq]
+                self.set_delivery(entry["inc_id"], entry["version"], entry["name"], "UNCONFIRMED")
+                self.store.save()
+                self.log.info("No ALERT_ACK from %s for %s v%s after %d attempts: UNCONFIRMED",
+                              entry["name"], entry["inc_id"], entry["version"], MAX_ATTEMPTS)
+                return
+            entry["attempt"] += 1
+            attempt = entry["attempt"]
+        self.log.info("No ALERT_ACK for RQ#%s, retransmitting (attempt %d/%d)", rq, attempt, MAX_ATTEMPTS)
+        self.send(entry["msg"], entry["addr"])
+        self.start_timer(rq)
+
+    def on_alert_ack(self, t, addr):
+       
+        if len(t) not in (4, 5):
+            self.log.info("Malformed ALERT_ACK ignored")
+            return None
+        rq, inc_id, name = t[1], t[2], t[-1]
+        entry = self.awaiting.get(rq)
+        if entry is None or entry["inc_id"] != inc_id or entry["name"] != name:
+            self.log.info("Duplicate or unexpected ALERT_ACK RQ#%s from %s ignored", rq, name)
+            return None
+        del self.awaiting[rq]
+        if entry.get("timer"):
+            entry["timer"].cancel()
+        self.set_delivery(inc_id, entry["version"], name, "ACKED")
+        self.store.save()
+        self.log.info("%s acknowledged %s v%s (attempt %d)", name, inc_id, entry["version"], entry["attempt"])
+        return None
 
     def on_register(self, t, addr):
         rq = t[1]
@@ -218,6 +330,55 @@ class EmergencyServer:
         self.print_users()
         return f"UNSUBSCRIBED {rq}"
 
+    def on_publish_alert(self, t, addr):
+        rq = t[1]
+        deny = f"ALERT_DENIED {rq} "
+
+        if len(t) != 8:
+            return deny + "Malformed_Request"
+        _, _, category, location, severity, title, description, attachment = t
+        category = category.upper()
+        location = location.upper()
+        severity = severity.upper()
+
+        name, user = self.user_by_addr(addr)
+
+        if user is None:
+            return deny + "Not_Registered"
+        if user["role"] not in ("PUBLISHER", "BOTH"):
+            return deny + "Unauthorized_Role"
+
+        if category not in CATEGORIES:
+            return deny + "Invalid_Category"
+        if location not in LOCATIONS:
+            return deny + "Invalid_Location"
+        if severity not in SEVERITY:
+            return deny + "Invalid_Severity"
+        
+        inc_id = f"INC{self.store.data['next_incident']}"
+        self.store.data["next_incident"] += 1
+        self.incidents[inc_id] = {
+            "publisher": name,
+            "category": category,
+            "location": location,
+            "severity": severity,
+            "title": title,
+            "description": description,
+            "attachment": attachment,
+            "version": 1,
+            "status": "ACTIVE",
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        
+        self.store.save()
+
+        self.log.info("%s published %s: %s at %s, %s, %s", name, inc_id,
+                  category, location, severity, title)
+        self.pool.submit(self.distribute, inc_id)
+
+        return f"ALERT_ACCEPTED {rq} {inc_id}"
+    
+
     def tcp_loop(self):
         while True:
             try:
@@ -280,6 +441,7 @@ def main():
     p.add_argument("--state", default=str(BASE_DIR / "data" / "server_state.json"))
     p.add_argument("--loss", type=float, default=0.0, help="simulated UDP loss rate, 0..1")
     p.add_argument("--workers", type=int, default=16)
+    p.add_argument("--ack-timeout", type=float, default=TIMEOUT, help="seconds to wait for ALERT_ACK")
     EmergencyServer(p.parse_args()).run()
 
 

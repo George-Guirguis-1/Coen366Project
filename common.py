@@ -16,6 +16,10 @@ ROLES = ("SUBSCRIBER", "PUBLISHER", "BOTH")
 LOCATIONS = ("HALL", "EV", "JMSB", "LOYOLA", "SGW", "ALL")
 CATEGORIES = ("FIRE", "SECURITY", "WEATHER", "POWER", "BUILDING", "GENERAL", "ALL")
 
+#Emergency incident severity levels
+SEVERITY = ("INFO", "WARNING", "CRITICAL")
+
+
 BASE_DIR = Path(__file__).resolve().parent
 _TOKEN = re.compile(r"\[[^\]]*\]|\S+")
 _NAME = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
@@ -105,3 +109,7 @@ def make_logger(name, filename):
         h.setFormatter(fmt)
         log.addHandler(h)
     return log
+
+def matches(sub, category, location):
+    sub_loc, sub_cat = sub
+    return sub_loc in (location, "ALL") and sub_cat in (category, "ALL")

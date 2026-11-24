@@ -5,7 +5,7 @@ import socket
 import sys
 import threading
 
-from common import (MAX_ATTEMPTS, SERVER_TCP_PORT, SERVER_UDP_PORT, TIMEOUT, local_ip,
+from common import (MAX_ATTEMPTS, SERVER_TCP_PORT, SERVER_UDP_PORT, TIMEOUT, SEVERITY, local_ip,
                     make_logger, make_tcp_listener, make_udp_socket, parse_list, recv_line,
                     tokenize, udp_recv)
 
@@ -14,6 +14,7 @@ HELP = """Commands:
   deregister
   subscribe <location> <category>
   unsubscribe <location> <category>
+  publish <category> <location> <severity> <title> <description> <file>  
   info                             show this client's state
   help
   quit"""
@@ -38,7 +39,10 @@ class Client:
         self.rq = 0
         self.rq_lock = threading.Lock()
         self.pending = {}
-        self.notify_handlers = {}
+        self.notify_handlers = {"ALERT": self.on_alert}
+        self.alerts = {}
+        self.seen = set()
+        self.seen_lock = threading.Lock()
         self.tcp_handlers = {}
         self.log = make_logger(f"CLIENT {self.name or self.udp_port}", f"client_{self.name or self.udp_port}.log")
         self.log.info("Client at %s (UDP %d, TCP %d) -> Emergency Server %s:%d",
@@ -160,6 +164,50 @@ class Client:
             self.log.info("%s denied: %s", "Unsubscribe" if unsubscribe else "Subscribe",
                           " ".join(reply[2:]) or "no reason given")
 
+    def on_alert(self, t, addr):
+        if addr[0] != self.server[0]:
+            self.log.info("ALERT from unknown source %s ignored", addr[0])
+            return
+        if len(t) != 10:
+            self.log.info("Malformed ALERT ignored")
+            return
+        _, rq, inc_id, version, cat, loc, sev, title, desc, attach = t
+       
+        if sev == "CRITICAL":
+            self.send(f"ALERT_ACK {rq} {inc_id} {version} {self.name}", self.server)
+        with self.seen_lock:
+            duplicate = (inc_id, version) in self.seen
+            self.seen.add((inc_id, version))
+        if duplicate:
+            self.log.info("Duplicate ALERT %s v%s: re-ACKed, not displayed", inc_id, version)
+            return
+        self.alerts[inc_id] = {"version": version, "category": cat, "location": loc,
+                           "severity": sev, "title": title, "description": desc,
+                           "attachment": attach, "status": "ACTIVE"}
+        print(f"\n*** {sev} ALERT {inc_id} (v{version}) | {cat} at {loc}\n"
+        f"    {title.replace('_', ' ')}: {desc.replace('_', ' ')}"
+        + (f"\n    Attachment: {attach}" if attach != "NONE" else "") + "\n> ", end="")
+
+    def cmd_publish(self, args):
+        if len(args) not in (5,6):
+            print("Input all arguments when publishing an alert.")
+            return
+        category = args[0].upper()
+        location = args[1].upper()
+        severity = args[2].upper()
+        title = args[3]
+        description = args[4]
+        attachment = args[5] if len(args) == 6 else "NONE"
+
+        reply = self.request("PUBLISH_ALERT", category, location, severity, title, description, attachment)
+        if not reply:
+            return
+        if reply[0] == "ALERT_ACCEPTED":
+            self.log.info("Incident %s created", reply[2])
+        else:
+            self.log.info("Publish denied: %s", " ".join(reply[2:]) or "no reason given")
+
+
     def cmd_info(self, args):
         subs = ", ".join(f"{l}/{c}" for l, c in sorted(self.subscriptions)) or "-"
         print(f"Name: {self.name or '-'}  Role: {self.role or '-'}  Registered: {self.registered}\n"
@@ -175,6 +223,7 @@ class Client:
             "deregister": self.cmd_deregister,
             "subscribe": self.cmd_subscribe,
             "unsubscribe": lambda a: self.cmd_subscribe(a, unsubscribe=True),
+            "publish": self.cmd_publish,
             "info": self.cmd_info,
             "help": lambda a: print(HELP),
         }
