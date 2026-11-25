@@ -1,4 +1,5 @@
 import ipaddress
+from urllib.parse import quote, unquote
 import logging
 import re
 import socket
@@ -83,13 +84,33 @@ def udp_recv(sock):
 
 
 def recv_line(conn, limit=65536):
+    """Read one complete UTF-8 header without consuming binary payload."""
     buf = bytearray()
     while len(buf) < limit:
         b = conn.recv(1)
-        if not b or b == b"\n":
-            break
+        if not b:
+            raise EOFError("Incomplete TCP header")
+        if b == b"\n":
+            return buf.decode("utf-8").rstrip("\r")
         buf += b
-    return buf.decode("utf-8", "replace").strip()
+    raise ValueError("TCP header too long")
+
+
+def encode_field(value):
+    return quote(value, safe="-_.~")
+
+
+def decode_field(value):
+    return unquote(value, errors="strict")
+
+
+def valid_filename(name):
+    # Portable basename only; no traversal, device names or control characters.
+    return (bool(name) and len(name.encode("utf-8")) <= 240
+            and name not in (".", "..", "NONE")
+            and not name.endswith((".", " "))
+            and not any(ord(ch) < 32 or ch in '<>:"/\\|?*' for ch in name)
+            and not re.fullmatch(r"CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³]|CONIN\$|CONOUT\$", name.split(".")[0].rstrip().upper()))
 
 
 def local_ip(target="8.8.8.8", port=80):
