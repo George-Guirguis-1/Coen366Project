@@ -18,6 +18,7 @@ HELP = """Commands:
   update <incident_id> <severity> <title> <description>
   close <incident_id> <reason>
   status <incident_id> <status>    status = SAFE | NEED_HELP | LEFT_AREA
+  attach <incident_id> <file>       discover attachment source
   info                             show this client's state
   help
   quit"""
@@ -330,6 +331,37 @@ class Client:
             self.log.info("Status rejected: %s", " ".join(reply[2:]) or "no reason given")
 
 
+    #2.9.A Request attachment source (UDP)
+    def cmd_attach(self, args):
+        if len(args) != 2:
+            print("Usage: attach <incident_id> <file>")
+            return
+        if not self.registered:
+            print("Register first.")
+            return
+        if self.role not in ("SUBSCRIBER", "BOTH"):
+            print("Only subscribers can request attachments.")
+            return
+
+        incident_id = args[0].upper()
+        file_name = args[1]
+        reply = self.request("ATTACH_REQ", incident_id, file_name)
+        if not reply:
+            return
+
+        if reply[0] == "ATTACH_INFO" and len(reply) == 7:
+            _, rq, inc_id, publisher, ip, tcp_port, filename = reply
+            self.log.info("Attachment source found for %s", inc_id)
+            print(f"Publisher: {publisher}")
+            print(f"IP address: {ip}")
+            print(f"TCP port: {tcp_port}")
+            print(f"File: {filename}")
+        elif reply[0] == "ATTACH_DENIED":
+            self.log.info("Attachment denied: %s",
+                          " ".join(reply[3:]) or "no reason given")
+        else:
+            self.log.info("Unexpected attachment response")
+
     def cmd_info(self, args):
         subs = ", ".join(f"{l}/{c}" for l, c in sorted(self.subscriptions)) or "-"
         print(f"Name: {self.name or '-'}  Role: {self.role or '-'}  Registered: {self.registered}\n"
@@ -349,6 +381,7 @@ class Client:
             "update": self.cmd_update,
             "close": self.cmd_close,
             "status": self.cmd_status,
+            "attach": self.cmd_attach,
             "info": self.cmd_info,
             "help": lambda a: print(HELP),
         }

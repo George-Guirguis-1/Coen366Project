@@ -60,6 +60,7 @@ class EmergencyServer:
             "CLOSE_ALERT": self.on_close_alert,
             "STATUS_REPORT": self.on_status_report,
             "ALERT_ACK": self.on_alert_ack,
+            "ATTACH_REQ": self.on_attach_req,
         }
         self.tcp_handlers = {}
         self.ack_timeout = args.ack_timeout
@@ -540,6 +541,42 @@ class EmergencyServer:
         self.log.info("%s reported %s for %s", name, status, incident_id)
         return f"STATUS_RECORDED {rq}"
 
+
+    #2.9.A Attachment source discovery (UDP)
+    def on_attach_req(self, t, addr):
+        rq = t[1]
+        incident_id = t[2].upper() if len(t) > 2 else "UNKNOWN"
+        deny = f"ATTACH_DENIED {rq} {incident_id} "
+
+        if len(t) != 4:
+            return deny + "Malformed_Request"
+        file_name = t[3]
+
+        name, user = self.user_by_addr(addr)
+        if user is None:
+            return deny + "Not_Registered"
+        if user["role"] not in ("SUBSCRIBER", "BOTH"):
+            return deny + "Unauthorized_Role"
+
+        incident = self.incidents.get(incident_id)
+        if incident is None:
+            return deny + "Unknown_Incident"
+        if incident["status"] != "ACTIVE":
+            return deny + "Incident_Closed"
+        if incident["attachment"] == "NONE":
+            return deny + "No_Attachment"
+        if incident["attachment"] != file_name:
+            return deny + "Attachment_Mismatch"
+
+        publisher_name = incident["publisher"]
+        publisher = self.users.get(publisher_name)
+        if publisher is None or publisher["role"] not in ("PUBLISHER", "BOTH"):
+            return deny + "Publisher_Unavailable"
+
+        self.log.info("%s requested %s for %s from %s",
+                      name, file_name, incident_id, publisher_name)
+        return (f"ATTACH_INFO {rq} {incident_id} {publisher_name} "
+                f"{publisher['ip']} {publisher['tcp_port']} {file_name}")
 
     def tcp_loop(self):
         while True:
