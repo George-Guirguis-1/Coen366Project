@@ -1,4 +1,8 @@
 import argparse
+import hashlib
+import re
+import tempfile
+from pathlib import Path
 import queue
 import random
 import socket
@@ -8,6 +12,22 @@ import threading
 from common import (MAX_ATTEMPTS, SERVER_TCP_PORT, SERVER_UDP_PORT, TIMEOUT, SEVERITY, local_ip,
                     make_logger, make_tcp_listener, make_udp_socket, parse_list, recv_line,
                     tokenize, udp_recv)
+
+TCP_TIMEOUT = 10.0
+CHUNK_SIZE = 65536
+MAX_FILE_SIZE = 64 * 1024 * 1024
+ATTACHMENT_DIR = Path(__file__).resolve().parent / "attachments"
+DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads"
+
+
+def valid_filename(name):
+    return (
+        bool(re.fullmatch(r"[A-Za-z0-9_.-]+", name))
+        and name not in (".", "..", "NONE")
+        and not name.endswith(".")
+        and not Path(name).is_reserved()
+    )
+
 
 HELP = """Commands:
   register [name] [role]           role = SUBSCRIBER | PUBLISHER | BOTH
@@ -19,6 +39,7 @@ HELP = """Commands:
   close <incident_id> <reason>
   status <incident_id> <status>    status = SAFE | NEED_HELP | LEFT_AREA
   attach <incident_id> <file>       discover attachment source
+  download <incident_id> <file>     download attachment using TCP
   info                             show this client's state
   help
   quit"""
@@ -48,7 +69,11 @@ class Client:
         self.alerts = {}
         self.seen = set()
         self.seen_lock = threading.Lock()
-        self.tcp_handlers = {}
+        self.published_files = {}
+        self.files_lock = threading.Lock()
+        self.tcp_handlers = {
+            "GET_ATTACHMENT": self.on_get_attachment
+        }
         self.log = make_logger(f"CLIENT {self.name or self.udp_port}", f"client_{self.name or self.udp_port}.log")
         self.log.info("Client at %s (UDP %d, TCP %d) -> Emergency Server %s:%d",
                       self.ip, self.udp_port, self.tcp_port, *self.server)
@@ -117,6 +142,7 @@ class Client:
     def handle_tcp(self, conn, addr):
         with conn:
             try:
+                conn.settimeout(TCP_TIMEOUT)
                 msg = recv_line(conn)
             except OSError:
                 return
@@ -269,10 +295,36 @@ class Client:
         description = args[4]
         attachment = args[5] if len(args) == 6 else "NONE"
 
+        if attachment != "NONE":
+            if not valid_filename(attachment):
+                print("Invalid attachment filename.")
+                return
+
+            file_path = ATTACHMENT_DIR / attachment
+
+            try:
+                if not file_path.is_file() or file_path.is_symlink():
+                    print(f"Attachment not found: {file_path}")
+                    return
+
+                if file_path.stat().st_size > MAX_FILE_SIZE:
+                    print("Attachment exceeds the 64 MiB limit.")
+                    return
+            except OSError as e:
+                self.log.info("Cannot access attachment: %s", e)
+                return
+
         reply = self.request("PUBLISH_ALERT", category, location, severity, title, description, attachment)
         if not reply:
             return
         if reply[0] == "ALERT_ACCEPTED":
+            if attachment != "NONE":
+                with self.files_lock:
+                    self.published_files[reply[2]] = (self.name, attachment)
+
+                self.log.info("Attachment %s available for %s",
+                              attachment, reply[2])
+
             self.log.info("Incident %s created", reply[2])
         else:
             self.log.info("Publish denied: %s", " ".join(reply[2:]) or "no reason given")
@@ -307,6 +359,9 @@ class Client:
         if not reply:
             return
         if reply[0] == "ALERT_CLOSED":
+            with self.files_lock:
+                self.published_files.pop(incident_id, None)
+
             self.log.info("Incident %s closed", reply[2])
         else:
             self.log.info("Close denied: %s", " ".join(reply[2:]) or "no reason given")
@@ -362,6 +417,308 @@ class Client:
         else:
             self.log.info("Unexpected attachment response")
 
+
+    #2.9.B Direct publisher-to-subscriber TCP transfer
+
+    def tcp_send_message(self, conn, msg):
+        conn.sendall((msg + "\n").encode("utf-8"))
+        self.log.info("TCP SEND | %s", msg)
+
+    def on_get_attachment(self, t, conn, addr):
+        rq = t[1] if len(t) > 1 else "UNKNOWN"
+        incident_id = t[3] if len(t) > 3 else "UNKNOWN"
+        file_name = t[4] if len(t) > 4 else "UNKNOWN"
+
+        def deny(reason):
+            self.tcp_send_message(
+                conn,
+                f"ATTACH_ERROR {rq} {incident_id} {file_name} {reason}"
+            )
+
+        try:
+            if len(t) != 5:
+                deny("Malformed_Request")
+                return
+
+            subscriber = t[2]
+
+            if not self.registered or self.role not in ("PUBLISHER", "BOTH"):
+                deny("Publisher_Unavailable")
+                return
+
+            if not valid_filename(file_name):
+                deny("Invalid_Filename")
+                return
+
+            # Only serve files belonging to published incidents
+            with self.files_lock:
+                published_file = self.published_files.get(incident_id)
+
+            if published_file != (self.name, file_name):
+                deny("Unknown_Incident_Or_Attachment")
+                return
+
+            file_path = ATTACHMENT_DIR / file_name
+
+            if not file_path.is_file() or file_path.is_symlink():
+                deny("File_Unavailable")
+                return
+
+            # Read a bounded snapshot so checksum and data match
+            try:
+                with open(file_path, "rb") as f:
+                    data = f.read(MAX_FILE_SIZE + 1)
+            except OSError:
+                deny("File_Unavailable")
+                return
+
+            if len(data) > MAX_FILE_SIZE:
+                deny("File_Too_Large")
+                return
+
+            file_size = len(data)
+            checksum = hashlib.sha256(data).hexdigest()
+
+            header = (
+                f"ATTACH_DATA {rq} {incident_id} "
+                f"{file_name} {file_size} {checksum}"
+            )
+
+            self.tcp_send_message(conn, header)
+
+            self.log.info("Sending %s (%d bytes) to %s",
+                          file_name, file_size, subscriber)
+
+            # Send binary data in chunks
+            for offset in range(0, file_size, CHUNK_SIZE):
+                conn.sendall(data[offset:offset + CHUNK_SIZE])
+
+            # Wait for application-level confirmation
+            reply = tokenize(recv_line(conn))
+
+            self.log.info("TCP RECV | %s", " ".join(reply))
+
+            expected = [rq, incident_id, file_name]
+
+            if reply == ["ATTACH_OK"] + expected:
+                self.log.info("Transfer verified by %s: %s",
+                              subscriber, file_name)
+
+            elif (len(reply) >= 5
+                  and reply[0] == "ATTACH_ERROR"
+                  and reply[1:4] == expected):
+                self.log.info("Transfer rejected by %s: %s",
+                              subscriber, " ".join(reply[4:]))
+
+            else:
+                self.log.info("Transfer not confirmed by %s", subscriber)
+
+        except OSError as e:
+            self.log.info("TCP attachment transfer failed: %s", e)
+
+    def cmd_download(self, args):
+        if len(args) != 2:
+            print("Usage: download <incident_id> <file>")
+            return
+
+        if not self.registered:
+            print("Register first.")
+            return
+
+        if self.role not in ("SUBSCRIBER", "BOTH"):
+            print("Only subscribers can download attachments.")
+            return
+
+        incident_id = args[0].upper()
+        file_name = args[1]
+
+        if not valid_filename(file_name):
+            print("Invalid attachment filename.")
+            return
+
+        if not re.fullmatch(r"INC[0-9]+", incident_id):
+            print("Invalid incident ID.")
+            return
+
+        # First discover the publisher using UDP
+        reply = self.request("ATTACH_REQ", incident_id, file_name)
+
+        if not reply:
+            return
+
+        if reply[0] == "ATTACH_DENIED":
+            self.log.info("Attachment denied: %s",
+                          " ".join(reply[3:]))
+            return
+
+        if reply[0] != "ATTACH_INFO" or len(reply) != 7:
+            self.log.info("Unexpected attachment response")
+            return
+
+        _, _, inc_id, publisher, ip, tcp_port, filename = reply
+
+        if inc_id != incident_id or filename != file_name:
+            self.log.info("Attachment information mismatch")
+            return
+
+        try:
+            port = int(tcp_port)
+
+            if not 1 <= port <= 65535:
+                raise ValueError("Invalid TCP port")
+
+        except ValueError:
+            self.log.info("Invalid publisher TCP port")
+            return
+
+        self.log.info("Publisher located: %s at %s:%d",
+                      publisher, ip, port)
+
+        # Keep UDP notifications and terminal input responsive
+        threading.Thread(
+            target=self.download_file,
+            args=(incident_id, file_name, ip, port, self.name),
+            daemon=True
+        ).start()
+
+    def download_file(self, incident_id, file_name, ip, port, subscriber):
+        rq = self.next_rq()
+        temp_path = None
+
+        try:
+            # Connect directly to the publisher
+            with socket.create_connection(
+                (ip, port), timeout=TCP_TIMEOUT
+            ) as conn:
+
+                conn.settimeout(TCP_TIMEOUT)
+
+                request = (
+                    f"GET_ATTACHMENT {rq} {subscriber} "
+                    f"{incident_id} {file_name}"
+                )
+
+                self.tcp_send_message(conn, request)
+
+                header = tokenize(recv_line(conn))
+
+                self.log.info("TCP RECV | %s", " ".join(header))
+
+                def report_error(reason):
+                    self.log.info("Download failed: %s", reason)
+
+                    try:
+                        self.tcp_send_message(
+                            conn,
+                            f"ATTACH_ERROR {rq} {incident_id} "
+                            f"{file_name} {reason}"
+                        )
+                    except OSError:
+                        pass
+
+                if (len(header) >= 5
+                    and header[0] == "ATTACH_ERROR"
+                    and header[1:4] == [rq, incident_id, file_name]):
+                    self.log.info("Publisher rejected transfer: %s",
+                                  " ".join(header[4:]))
+                    return
+
+                if (len(header) != 6
+                    or header[0] != "ATTACH_DATA"
+                    or header[1:4] != [rq, incident_id, file_name]):
+                    report_error("Invalid_Header")
+                    return
+
+                try:
+                    file_size = int(header[4])
+
+                    if not 0 <= file_size <= MAX_FILE_SIZE:
+                        raise ValueError()
+
+                    expected_checksum = header[5].lower()
+
+                    if not re.fullmatch(r"[0-9a-f]{64}", expected_checksum):
+                        raise ValueError()
+
+                except ValueError:
+                    report_error("Invalid_File_Metadata")
+                    return
+
+                target_dir = DOWNLOAD_DIR / subscriber / incident_id
+                target_path = target_dir / file_name
+
+                checksum = hashlib.sha256()
+                remaining = file_size
+
+                try:
+                    target_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Use a temporary file until verification succeeds
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb",
+                        dir=target_dir,
+                        suffix=".part",
+                        delete=False
+                    ) as f:
+
+                        temp_path = Path(f.name)
+
+                        while remaining > 0:
+                            chunk = conn.recv(
+                                min(CHUNK_SIZE, remaining)
+                            )
+
+                            if not chunk:
+                                break
+
+                            f.write(chunk)
+                            checksum.update(chunk)
+                            remaining -= len(chunk)
+
+                    if remaining != 0:
+                        report_error("Incomplete_Transfer")
+                        return
+
+                    actual_checksum = checksum.hexdigest()
+
+                    if actual_checksum != expected_checksum:
+                        report_error("Checksum_Mismatch")
+                        return
+
+                    # Only keep a successfully verified file
+                    temp_path.replace(target_path)
+                    temp_path = None
+
+                except TimeoutError:
+                    report_error("Transfer_Timeout")
+                    return
+
+                except OSError:
+                    report_error("Transfer_IO_Error")
+                    return
+
+                self.log.info("Received %d bytes", file_size)
+                self.log.info("Expected SHA-256: %s", expected_checksum)
+                self.log.info("Actual SHA-256:   %s", actual_checksum)
+                self.log.info("Checksum verification PASSED")
+                self.log.info("File saved: %s", target_path)
+
+                self.tcp_send_message(
+                    conn,
+                    f"ATTACH_OK {rq} {incident_id} {file_name}"
+                )
+
+        except OSError as e:
+            self.log.info("TCP download communication failed: %s", e)
+
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError as e:
+                    self.log.info("Temporary file cleanup failed: %s", e)
+
+
     def cmd_info(self, args):
         subs = ", ".join(f"{l}/{c}" for l, c in sorted(self.subscriptions)) or "-"
         print(f"Name: {self.name or '-'}  Role: {self.role or '-'}  Registered: {self.registered}\n"
@@ -382,6 +739,7 @@ class Client:
             "close": self.cmd_close,
             "status": self.cmd_status,
             "attach": self.cmd_attach,
+            "download": self.cmd_download,
             "info": self.cmd_info,
             "help": lambda a: print(HELP),
         }
