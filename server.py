@@ -60,12 +60,21 @@ class EmergencyServer:
             "CLOSE_ALERT": self.on_close_alert,
             "STATUS_REPORT": self.on_status_report,
             "ALERT_ACK": self.on_alert_ack,
+            "ATTACH_REQ": self.on_attach_req,
         }
-        self.tcp_handlers = {}
+        self.tcp_handlers = {"GET_ACTIVE_ALERTS": self.on_get_active_alerts,
+                             "CHECK_ATTACHMENT": self.on_check_attachment}
         self.ack_timeout = args.ack_timeout
         self.awaiting = {}                   
         self.store.data.setdefault("deliveries", {})
         self.store.data.setdefault("status_reports", {})
+        # Timers are process-local; interrupted deliveries are not assumed successful.
+        for versions in self.store.data["deliveries"].values():
+            for recipients in versions.values():
+                for name, status in recipients.items():
+                    if status == "PENDING":
+                        recipients[name] = "UNCONFIRMED"
+        self.store.save()
         self.log.info("Emergency Server listening on UDP %s:%d and TCP %s:%d",
                       args.host, args.udp_port, args.host, args.tcp_port)
         self.log.info("Clients on other computers connect with: --server %s", local_ip())
@@ -106,7 +115,7 @@ class EmergencyServer:
             self.log.info("Malformed message (missing RQ#) from %s:%d ignored", *addr)
             return
         with self.store.lock:
-            reply = self.cached_reply(addr, msg)
+            reply = None if t[0] == "ATTACH_REQ" else self.cached_reply(addr, msg)
             if reply:
                 self.log.info("Duplicate request RQ#%s from %s:%d, resending previous reply", t[1], *addr)
             else:
@@ -115,7 +124,7 @@ class EmergencyServer:
                 except Exception:
                     self.log.exception("Error while handling: %s", msg)
                     return
-                if reply:
+                if reply and t[0] != "ATTACH_REQ":
                     self.replies[(addr, msg)] = (reply, time.time())
         if reply:
             self.send(reply, addr)
@@ -157,8 +166,12 @@ class EmergencyServer:
                 inc = self.incidents.get(inc_id)
                 if inc is None:
                     return
+                inc = dict(inc)
+                inc["recipients"] = self.incidents[inc_id].setdefault("recipients", [])
                 outgoing = []
                 for name, addr in self.find_recipients(inc):
+                    if name not in inc.setdefault("recipients", []):
+                        inc["recipients"].append(name)
                     msg = (f"ALERT {self.next_rq()} {inc_id} {inc['version']} {inc['category']} "
                            f"{inc['location']} {inc['severity']} {inc['title']} "
                            f"{inc['description']} {inc['attachment']}")
@@ -222,12 +235,13 @@ class EmergencyServer:
 
     def on_alert_ack(self, t, addr):
        
-        if len(t) not in (4, 5):
+        if len(t) != 5:
             self.log.info("Malformed ALERT_ACK ignored")
             return None
         rq, inc_id, name = t[1], t[2], t[-1]
         entry = self.awaiting.get(rq)
-        if entry is None or entry["inc_id"] != inc_id or entry["name"] != name:
+        if (entry is None or entry["inc_id"] != inc_id or entry["name"] != name or
+                str(entry["version"]) != t[3] or entry["addr"] != addr):
             self.log.info("Duplicate or unexpected ALERT_ACK RQ#%s from %s ignored", rq, name)
             return None
         del self.awaiting[rq]
@@ -432,6 +446,8 @@ class EmergencyServer:
             recipients = self.find_recipients(incident)
             messages = []
             for name, addr in recipients:
+                if name not in incident.setdefault("recipients", []):
+                    incident["recipients"].append(name)
                 rq = self.next_rq()
                 msg = (f"ALERT_UPDATE {rq} {incident_id} {version} {severity} "
                        f"{incident['title']} {incident['description']}")
@@ -490,7 +506,15 @@ class EmergencyServer:
         with self.store.lock:
             incident = self.incidents[incident_id]
             version = incident["version"]
-            recipients = self.find_recipients(incident)
+            recipients = dict(self.find_recipients(incident))
+            prior = set(incident.get("recipients", []))
+            for deliveries in self.store.data["deliveries"].get(incident_id, {}).values():
+                prior.update(deliveries)
+            for name in prior:
+                user = self.users.get(name)
+                if user and user["role"] != "PUBLISHER":
+                    recipients[name] = tuple(user["seen"])
+            recipients = list(recipients.items())
             messages = []
             for name, addr in recipients:
                 rq = self.next_rq()
@@ -541,6 +565,99 @@ class EmergencyServer:
         return f"STATUS_RECORDED {rq}"
 
 
+    #2.9.A Attachment source discovery (UDP)
+    def on_attach_req(self, t, addr):
+        rq = t[1]
+        incident_id = t[2].upper() if len(t) > 2 else "UNKNOWN"
+        deny = f"ATTACH_DENIED {rq} {incident_id} "
+
+        if len(t) != 4:
+            return deny + "Malformed_Request"
+        file_name = t[3]
+
+        name, user = self.user_by_addr(addr)
+        if user is None:
+            return deny + "Not_Registered"
+        if user["role"] not in ("SUBSCRIBER", "BOTH"):
+            return deny + "Unauthorized_Role"
+
+        incident = self.incidents.get(incident_id)
+        if incident is None:
+            return deny + "Unknown_Incident"
+        if incident["status"] != "ACTIVE":
+            return deny + "Incident_Closed"
+        if incident["attachment"] == "NONE":
+            return deny + "No_Attachment"
+        if incident["attachment"] != file_name:
+            return deny + "Attachment_Mismatch"
+
+        publisher_name = incident["publisher"]
+        publisher = self.users.get(publisher_name)
+        if publisher is None or publisher["role"] not in ("PUBLISHER", "BOTH"):
+            return deny + "Publisher_Unavailable"
+
+        self.log.info("%s requested %s for %s from %s",
+                      name, file_name, incident_id, publisher_name)
+        return (f"ATTACH_INFO {rq} {incident_id} {publisher_name} "
+                f"{publisher['ip']} {publisher['tcp_port']} {file_name}")
+
+    def tcp_send(self, conn, message):
+        conn.sendall((message + "\n").encode("utf-8"))
+        self.log.info("TCP SEND | %s", message)
+
+    #2.10 Active incident synchronization
+    def on_get_active_alerts(self, t, conn, addr):
+        rq = t[1] if len(t) > 1 else "UNKNOWN"
+        try:
+            with self.store.lock:
+                user = self.users.get(t[2]) if len(t) == 3 else None
+                reason = ("Malformed_Request" if len(t) != 3 else
+                          "Not_Registered" if user is None else
+                          "Unauthorized_Role" if user["role"] == "PUBLISHER" else None)
+                records = []
+                if not reason:
+                    fields = ("version", "category", "location", "severity", "status",
+                              "title", "description", "attachment")
+                    for key, inc in self.incidents.items():
+                        if inc["status"] == "ACTIVE" and any(matches(sub, inc["category"], inc["location"]) for sub in user["subscriptions"]):
+                            records.append(dict(incident_id=key, **{f: inc[f] for f in fields}))
+            if reason:
+                self.tcp_send(conn, f"ACTIVE_ALERTS_DENIED {rq} {reason}")
+                return
+            self.tcp_send(conn, f"ACTIVE_ALERTS {rq} {len(records)}")
+            for record in records:
+                self.tcp_send(conn, json.dumps(record, ensure_ascii=True))
+        except OSError as e:
+            self.log.info("Sync failed: %s", e)
+
+    # Extension: publisher checks persisted ownership before serving a file.
+    # This avoids a second, potentially inconsistent publisher-side database.
+    def on_check_attachment(self, t, conn, addr):
+        rq = t[1] if len(t) > 1 else "UNKNOWN"
+        reason = "Malformed_Request"
+        if len(t) == 6:
+            _, _, publisher, subscriber, incident_id, filename = t
+            with self.store.lock:
+                owner = self.users.get(publisher)
+                peer = self.users.get(subscriber)
+                inc = self.incidents.get(incident_id)
+                if not owner or owner["role"] not in ("PUBLISHER", "BOTH"):
+                    reason = "Publisher_Unavailable"
+                elif not peer or peer["role"] not in ("SUBSCRIBER", "BOTH"):
+                    reason = "Subscriber_Not_Registered"
+                elif not inc or inc["publisher"] != publisher:
+                    reason = "Unknown_Incident_Or_Attachment"
+                elif inc["status"] != "ACTIVE":
+                    reason = "Incident_Closed"
+                elif filename == "NONE" or inc["attachment"] != filename:
+                    reason = "Attachment_Mismatch"
+                else:
+                    reason = None
+        try:
+            self.tcp_send(conn, f"CHECK_DENIED {rq} {reason}" if reason else f"CHECK_OK {rq}")
+        except OSError as e:
+            self.log.info("Attachment validation failed: %s", e)
+
     def tcp_loop(self):
         while True:
             try:
@@ -552,8 +669,9 @@ class EmergencyServer:
     def handle_tcp(self, conn, addr):
         with conn:
             try:
+                conn.settimeout(10)
                 msg = recv_line(conn)
-            except OSError:
+            except (OSError, EOFError, ValueError):
                 return
             self.log.info("TCP RECV <- %s:%d | %s", addr[0], addr[1], msg)
             t = tokenize(msg)
