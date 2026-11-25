@@ -1,4 +1,5 @@
 import argparse
+import json
 import hashlib
 import re
 import tempfile
@@ -25,7 +26,10 @@ def valid_filename(name):
         bool(re.fullmatch(r"[A-Za-z0-9_.-]+", name))
         and name not in (".", "..", "NONE")
         and not name.endswith(".")
-        and not Path(name).is_reserved()
+        and not re.fullmatch(
+            r"CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CONIN\$|CONOUT\$",
+            name.split(".")[0].upper()
+        )
     )
 
 
@@ -40,6 +44,8 @@ HELP = """Commands:
   status <incident_id> <status>    status = SAFE | NEED_HELP | LEFT_AREA
   attach <incident_id> <file>       discover attachment source
   download <incident_id> <file>     download attachment using TCP
+  sync                             recover active alerts using TCP
+  alerts                           display locally stored active alerts
   info                             show this client's state
   help
   quit"""
@@ -67,6 +73,7 @@ class Client:
         self.notify_handlers = {"ALERT": self.on_alert, "ALERT_UPDATE": self.on_alert_update,
                                 "ALL_CLEAR": self.on_all_clear}
         self.alerts = {}
+        self.alerts_lock = threading.RLock()
         self.seen = set()
         self.seen_lock = threading.Lock()
         self.published_files = {}
@@ -122,7 +129,7 @@ class Client:
             handler = self.notify_handlers.get(t[0])
             box = self.pending.get(t[1]) if len(t) > 1 and addr[0] == self.server[0] else None
             if handler:
-                threading.Thread(target=handler, args=(t, addr), daemon=True).start()
+                threading.Thread(target=self.handle_notification, args=(handler, t, addr), daemon=True).start()
             elif box:
                 try:
                     box.put_nowait(msg)
@@ -719,6 +726,257 @@ class Client:
                     self.log.info("Temporary file cleanup failed: %s", e)
 
 
+
+    def handle_notification(self, handler, t, addr):
+        with self.alerts_lock:
+            handler(t, addr)
+
+    # Read a complete newline-terminated TCP message.
+    # Reject incomplete or oversized messages.
+
+    def recv_sync_line(self, conn, limit=65536):
+        data = bytearray()
+
+        while len(data) < limit:
+            byte = conn.recv(1)
+
+            if not byte:
+                raise EOFError("Incomplete TCP message")
+
+            if byte == b"\n":
+                return data.decode("utf-8")
+
+            data.extend(byte)
+
+        raise ValueError("TCP message exceeds size limit")
+
+    #2.10 Recover active incidents using TCP
+
+    def cmd_sync(self, args):
+        if args:
+            print("Usage: sync")
+            return
+
+        if not self.registered:
+            print("Register first.")
+            return
+
+        if self.role not in ("SUBSCRIBER", "BOTH"):
+            print("Only subscribers can synchronize alerts.")
+            return
+
+        rq = self.next_rq()
+
+        # Remember local state before synchronization
+        with self.alerts_lock:
+            previous_alerts = {
+                key: dict(value)
+                for key, value in self.alerts.items()
+            }
+
+            previous_seen = set(self.seen)
+
+        recovered = {}
+
+        try:
+            with socket.create_connection(
+                self.server_tcp, timeout=TCP_TIMEOUT
+            ) as conn:
+
+                conn.settimeout(TCP_TIMEOUT)
+
+                self.tcp_send_message(
+                    conn,
+                    f"GET_ACTIVE_ALERTS {rq} {self.name}"
+                )
+
+                header = tokenize(self.recv_sync_line(conn))
+
+                self.log.info("TCP RECV | %s", " ".join(header))
+
+                if (len(header) >= 3
+                    and header[0] == "ACTIVE_ALERTS_DENIED"
+                    and header[1] == rq):
+
+                    self.log.info(
+                        "Synchronization denied: %s",
+                        " ".join(header[2:])
+                    )
+                    return
+
+                if (len(header) != 3
+                    or header[0] != "ACTIVE_ALERTS"
+                    or header[1] != rq):
+
+                    raise ValueError("Invalid ACTIVE_ALERTS header")
+
+                count = int(header[2])
+
+                if not 0 <= count <= 10000:
+                    raise ValueError("Invalid incident count")
+
+                required_fields = {
+                    "incident_id", "version", "category",
+                    "location", "severity", "status",
+                    "title", "description", "attachment"
+                }
+
+                # Read exactly the announced number of records
+                for _ in range(count):
+                    line = self.recv_sync_line(conn)
+
+                    self.log.info("TCP RECV | %s", line)
+
+                    record = json.loads(line)
+
+                    if not isinstance(record, dict):
+                        raise ValueError("Invalid incident record")
+
+                    if not required_fields.issubset(record):
+                        raise ValueError("Incomplete incident record")
+
+                    if record["status"] != "ACTIVE":
+                        raise ValueError("Unexpected incident status")
+
+                    if type(record["version"]) is not int or record["version"] < 1:
+                        raise ValueError("Invalid incident version")
+
+                    incident_id = record["incident_id"]
+
+                    if not isinstance(incident_id, str) or not re.fullmatch(
+                        r"INC[0-9]+", incident_id
+                    ):
+                        raise ValueError("Invalid incident ID")
+
+                    if incident_id in recovered:
+                        raise ValueError("Duplicate incident record")
+
+                    for field in required_fields - {"version"}:
+                        if not isinstance(record[field], str):
+                            raise ValueError("Invalid incident field")
+
+                    if record["severity"] not in SEVERITY:
+                        raise ValueError("Invalid incident severity")
+
+                    recovered[incident_id] = {
+                        field: record[field]
+                        for field in required_fields
+                        if field != "incident_id"
+                    }
+
+                    # Match existing UDP version representation
+                    recovered[incident_id]["version"] = str(
+                        record["version"]
+                    )
+
+            # Update local state only after the complete TCP
+            # response has been received and validated.
+            with self.alerts_lock:
+
+                # Identify UDP notifications processed during sync.
+                new_seen = self.seen - previous_seen
+                changed_ids = {key for key, version in new_seen}
+
+                # Remove stale active incidents, except those
+                # changed by UDP while synchronization was running.
+                for incident_id in list(self.alerts):
+
+                    if incident_id in changed_ids:
+                        continue
+
+                    if (
+                        incident_id in previous_alerts
+                        and incident_id not in recovered
+                        and self.alerts[incident_id]["status"] == "ACTIVE"
+                    ):
+                        del self.alerts[incident_id]
+
+                for incident_id, record in recovered.items():
+
+                    local = self.alerts.get(incident_id)
+                    incoming_version = int(record["version"])
+
+                    known_versions = [
+                        int(version)
+                        for key, version in self.seen
+                        if key == incident_id
+                        and str(version).isdigit()
+                    ]
+
+                    # Never replace a newer notification with an
+                    # older TCP snapshot.
+                    if known_versions and max(known_versions) > incoming_version:
+                        self.log.info(
+                            "Skipped older snapshot for %s; "
+                            "run sync again if needed",
+                            incident_id
+                        )
+                        continue
+
+                    if local and int(local["version"]) > incoming_version:
+                        continue
+
+                    if (
+                        local
+                        and local["status"] == "CLOSED"
+                        and int(local["version"]) >= incoming_version
+                    ):
+                        continue
+
+                    self.alerts[incident_id] = record
+
+                    with self.seen_lock:
+                        self.seen.add(
+                            (incident_id, record["version"])
+                        )
+
+            self.log.info(
+                "Synchronization complete: %d matching active incident(s) received",
+                count
+            )
+
+            self.cmd_alerts([])
+
+        except (OSError, EOFError, ValueError) as e:
+            self.log.info("Synchronization failed: %s", e)
+
+    def cmd_alerts(self, args):
+        if args:
+            print("Usage: alerts")
+            return
+
+        with self.alerts_lock:
+            active = {
+                key: dict(value)
+                for key, value in self.alerts.items()
+                if value["status"] == "ACTIVE"
+            }
+
+        print(f"\nActive incidents: {len(active)}")
+
+        if not active:
+            print("No active incidents.")
+            return
+
+        for incident_id, incident in sorted(active.items()):
+            print(
+                f"\n{incident_id} (v{incident['version']})"
+                f" | {incident['severity']}"
+                f" | {incident['category']}"
+                f" at {incident['location']}"
+            )
+
+            print(
+                f"  {incident['title'].replace('_', ' ')}:"
+                f" {incident['description'].replace('_', ' ')}"
+            )
+
+            if incident["attachment"] != "NONE":
+                print(f"  Attachment: {incident['attachment']}")
+
+        print()
+
+
     def cmd_info(self, args):
         subs = ", ".join(f"{l}/{c}" for l, c in sorted(self.subscriptions)) or "-"
         print(f"Name: {self.name or '-'}  Role: {self.role or '-'}  Registered: {self.registered}\n"
@@ -740,6 +998,8 @@ class Client:
             "status": self.cmd_status,
             "attach": self.cmd_attach,
             "download": self.cmd_download,
+            "sync": self.cmd_sync,
+            "alerts": self.cmd_alerts,
             "info": self.cmd_info,
             "help": lambda a: print(HELP),
         }

@@ -62,7 +62,9 @@ class EmergencyServer:
             "ALERT_ACK": self.on_alert_ack,
             "ATTACH_REQ": self.on_attach_req,
         }
-        self.tcp_handlers = {}
+        self.tcp_handlers = {
+            "GET_ACTIVE_ALERTS": self.on_get_active_alerts
+        }
         self.ack_timeout = args.ack_timeout
         self.awaiting = {}                   
         self.store.data.setdefault("deliveries", {})
@@ -578,6 +580,85 @@ class EmergencyServer:
         return (f"ATTACH_INFO {rq} {incident_id} {publisher_name} "
                 f"{publisher['ip']} {publisher['tcp_port']} {file_name}")
 
+
+    #2.10 Recovering current emergency information (TCP)
+    def on_get_active_alerts(self, t, conn, addr):
+        rq = t[1] if len(t) > 1 else "UNKNOWN"
+
+        def send_line(message):
+            conn.sendall((message + "\n").encode("utf-8"))
+            self.log.info("TCP SEND -> %s:%d | %s",
+                          addr[0], addr[1], message)
+
+        try:
+            if len(t) != 3:
+                send_line(f"ACTIVE_ALERTS_DENIED {rq} Malformed_Request")
+                return
+
+            name = t[2]
+            records = []
+            denial = None
+
+            # Take a consistent snapshot of server state
+            with self.store.lock:
+                user = self.users.get(name)
+
+                if user is None:
+                    denial = "Not_Registered"
+
+                elif user["role"] not in ("SUBSCRIBER", "BOTH"):
+                    denial = "Unauthorized_Role"
+
+                else:
+                    for incident_id, incident in self.incidents.items():
+
+                        # Only return active incidents
+                        if incident["status"] != "ACTIVE":
+                            continue
+
+                        # Match the subscriber's subscriptions
+                        matching = any(
+                            matches(
+                                sub,
+                                incident["category"],
+                                incident["location"]
+                            )
+                            for sub in user["subscriptions"]
+                        )
+
+                        if not matching:
+                            continue
+
+                        records.append({
+                            "incident_id": incident_id,
+                            "version": incident["version"],
+                            "category": incident["category"],
+                            "location": incident["location"],
+                            "severity": incident["severity"],
+                            "status": incident["status"],
+                            "title": incident["title"],
+                            "description": incident["description"],
+                            "attachment": incident["attachment"]
+                        })
+
+            # Do not hold the storage lock during TCP transmission
+            if denial:
+                send_line(f"ACTIVE_ALERTS_DENIED {rq} {denial}")
+                return
+
+            send_line(f"ACTIVE_ALERTS {rq} {len(records)}")
+
+            # Each incident is encoded as one JSON line
+            for record in records:
+                send_line(json.dumps(record, ensure_ascii=True))
+
+            self.log.info("Synchronized %d active incident(s) for %s",
+                          len(records), name)
+
+        except OSError as e:
+            self.log.info("TCP synchronization failed: %s", e)
+
+
     def tcp_loop(self):
         while True:
             try:
@@ -589,6 +670,7 @@ class EmergencyServer:
     def handle_tcp(self, conn, addr):
         with conn:
             try:
+                conn.settimeout(10.0)
                 msg = recv_line(conn)
             except OSError:
                 return
